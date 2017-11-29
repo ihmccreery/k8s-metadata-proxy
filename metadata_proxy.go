@@ -3,16 +3,23 @@ package main
 import (
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
+	_ "net/http/pprof"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
+
+	"golang.org/x/net/netutil"
 
 	"github.com/GoogleCloudPlatform/k8s-metadata-proxy/metrics"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+const servingGoRoutines = 100
 
 var (
 	concealedEndpoints = []string{
@@ -54,10 +61,14 @@ func main() {
 	flag.Parse()
 
 	go func() {
+		err := http.ListenAndServe("127.0.0.1:990", nil)
+		log.Fatalf("Failed to start pprof: %v", err)
+	}()
+	go func() {
 		err := http.ListenAndServe(*metricsAddr, promhttp.Handler())
 		log.Fatalf("Failed to start metrics: %v", err)
 	}()
-	log.Fatal(http.ListenAndServe(*addr, newMetadataHandler()))
+	log.Fatal(listenAndServe(*addr, newMetadataHandler()))
 }
 
 // xForwardedForStripper is identical to http.DefaultTransport except that it
@@ -71,6 +82,27 @@ type xForwardedForStripper struct{}
 func (x xForwardedForStripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	req.Header.Del("X-Forwarded-For")
 	return http.DefaultTransport.RoundTrip(req)
+}
+
+type bufferPool struct {
+	pool chan []byte
+}
+
+func newBufferPool() bufferPool {
+	pool := make(chan []byte, servingGoRoutines)
+	for i := 0; i < cap(pool); i++ {
+		// Default size for ReverseProxy.
+		pool <- make([]byte, 32*1024)
+	}
+	return bufferPool{pool}
+}
+
+func (bp bufferPool) Get() []byte {
+	return <-bp.pool
+}
+
+func (bp bufferPool) Put(x []byte) {
+	bp.pool <- x
 }
 
 // responseWriter wraps the given http.ResponseWriter to record metrics.
@@ -104,6 +136,7 @@ func newMetadataHandler() *metadataHandler {
 	proxy := httputil.NewSingleHostReverseProxy(u)
 
 	proxy.Transport = xForwardedForStripper{}
+	proxy.BufferPool = newBufferPool()
 
 	return &metadataHandler{
 		proxy: proxy,
@@ -174,4 +207,44 @@ func (h *metadataHandler) ServeHTTP(hrw http.ResponseWriter, req *http.Request) 
 	// it.
 	rw.filterResult = filterResultBlocked
 	http.Error(rw, "This metadata API is not allowed by the metadata proxy.", http.StatusForbidden)
+}
+
+// Below is modified from net/http.
+
+// ListenAndServe listens on the TCP network address addr
+// and then calls Serve with handler to handle requests
+// on incoming connections.
+// Accepted connections are configured to enable TCP keep-alives.
+// Handler is typically nil, in which case the DefaultServeMux is
+// used.
+//
+// ListenAndServe always returns a non-nil error.
+func listenAndServe(addr string, handler http.Handler) error {
+	srv := &http.Server{Addr: addr, Handler: handler}
+	if addr == "" {
+		addr = ":http"
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	return srv.Serve(netutil.LimitListener(tcpKeepAliveListener{ln.(*net.TCPListener)}, servingGoRoutines))
+}
+
+// tcpKeepAliveListener sets TCP keep-alive timeouts on accepted
+// connections. It's used by ListenAndServe and ListenAndServeTLS so
+// dead TCP connections (e.g. closing laptop mid-download) eventually
+// go away.
+type tcpKeepAliveListener struct {
+	*net.TCPListener
+}
+
+func (ln tcpKeepAliveListener) Accept() (c net.Conn, err error) {
+	tc, err := ln.AcceptTCP()
+	if err != nil {
+		return
+	}
+	tc.SetKeepAlive(true)
+	tc.SetKeepAlivePeriod(3 * time.Minute)
+	return tc, nil
 }
