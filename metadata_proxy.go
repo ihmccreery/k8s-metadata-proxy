@@ -22,10 +22,10 @@ import (
 const servingGoRoutines = 100
 
 var (
-	concealedEndpoints = []string{
-		"/0.1/meta-data/attributes/kube-env",
-		"/computeMetadata/v1beta1/instance/attributes/kube-env",
-		"/computeMetadata/v1/instance/attributes/kube-env",
+	concealedEndpoints = map[string]bool{
+		"/0.1/meta-data/attributes/kube-env":                    true,
+		"/computeMetadata/v1beta1/instance/attributes/kube-env": true,
+		"/computeMetadata/v1/instance/attributes/kube-env":      true,
 	}
 	concealedPatterns = []*regexp.Regexp{
 		regexp.MustCompile("/0.1/meta-data/service-accounts/.+/identity"),
@@ -37,16 +37,16 @@ var (
 		"/computeMetadata/v1beta1/",
 		"/computeMetadata/v1/",
 	}
-	discoveryEndpoints = []string{
-		"",
-		"/",
-		"/0.1",
-		"/0.1/",
-		"/0.1/meta-data",
-		"/computeMetadata",
-		"/computeMetadata/",
-		"/computeMetadata/v1beta1",
-		"/computeMetadata/v1",
+	discoveryEndpoints = map[string]bool{
+		"":                         true,
+		"/":                        true,
+		"/0.1":                     true,
+		"/0.1/":                    true,
+		"/0.1/meta-data":           true,
+		"/computeMetadata":         true,
+		"/computeMetadata/":        true,
+		"/computeMetadata/v1beta1": true,
+		"/computeMetadata/v1":      true,
 	}
 )
 
@@ -167,15 +167,16 @@ func (h *metadataHandler) ServeHTTP(hrw http.ResponseWriter, req *http.Request) 
 		return
 	}
 
+	// TODO(ihmccreery) Converting this into a whitelist might help with
+	// performance as well.
+
 	// Conceal kube-env and vm identity endpoints for known API versions.
 	// Don't block unknown API versions, since we don't know if they have
 	// the same paths.
-	for _, e := range concealedEndpoints {
-		if req.URL.Path == e {
-			rw.filterResult = filterResultBlocked
-			http.Error(rw, "This metadata endpoint is concealed.", http.StatusForbidden)
-			return
-		}
+	if _, ok := concealedEndpoints[req.URL.Path]; ok {
+		rw.filterResult = filterResultBlocked
+		http.Error(rw, "This metadata endpoint is concealed.", http.StatusForbidden)
+		return
 	}
 	for _, p := range concealedPatterns {
 		if p.MatchString(req.URL.Path) {
@@ -195,12 +196,10 @@ func (h *metadataHandler) ServeHTTP(hrw http.ResponseWriter, req *http.Request) 
 			return
 		}
 	}
-	for _, e := range discoveryEndpoints {
-		if req.URL.Path == e {
-			rw.filterResult = filterResultProxied
-			h.proxy.ServeHTTP(rw, req)
-			return
-		}
+	if _, ok := discoveryEndpoints[req.URL.Path]; ok {
+		rw.filterResult = filterResultProxied
+		h.proxy.ServeHTTP(rw, req)
+		return
 	}
 
 	// If none of the above checks match, this is an unknown API, so block
